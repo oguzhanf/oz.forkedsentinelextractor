@@ -222,10 +222,10 @@ python code/sentinel_restore.py --restore-all \
 | `--restore-hunting` | Hunting Queries & Relations | :white_check_mark: Implemented |
 | `--restore-workspace-functions` | Workspace Functions (parsers) | :white_check_mark: Implemented |
 | `--restore-saved-queries` | Saved Queries | :x: Not yet implemented |
-| `--restore-watchlists` | Watchlists | :x: Not yet implemented |
+| `--restore-watchlists` | Watchlists | :white_check_mark: Implemented |
 | `--restore-dcr` | Data Collection Rules | :white_check_mark: Implemented |
 | `--restore-dce` | Data Collection Endpoints | :white_check_mark: Implemented |
-| `--restore-workbooks` | Workbooks | :x: Not yet implemented |
+| `--restore-workbooks` | Workbooks | :white_check_mark: Implemented |
 | `--restore-logic-apps` | Logic Apps | :white_check_mark: Implemented |
 | `--restore-custom-tables` | Custom Tables | :white_check_mark: Implemented |
 | `--restore-table-retention` | Table Retention Settings | :white_check_mark: Implemented |
