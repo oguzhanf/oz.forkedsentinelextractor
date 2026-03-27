@@ -24,6 +24,8 @@ SAFETY: Nothing is restored unless you pass at least one --restore-* flag
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import logging
 import os
@@ -74,6 +76,7 @@ API_VERSION_CONTENT_PACKAGES    = "2025-07-01-preview"
 API_VERSION_HUNTING              = "2025-07-01-preview"
 API_VERSION_HUNTING_QUERIES      = "2025-07-01"
 API_VERSION_THREAT_INTELLIGENCE  = "2025-07-01-preview"
+API_VERSION_WATCHLISTS           = "2025-07-01-preview"
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -749,8 +752,160 @@ def restore_saved_queries(workspace_base: str, headers: dict, input_root: Path) 
     return _stub_not_implemented("Saved Queries")
 
 
-def restore_watchlists(sentinel_base: str, headers: dict, input_root: Path) -> int:
-    return _stub_not_implemented("Watchlists")
+# ---------------------------------------------------------------------------
+# Watchlists
+# ---------------------------------------------------------------------------
+
+# Watchlist properties that are read-only / server-managed and must NOT be sent in PUT.
+_WATCHLIST_STRIP_PROPS = {
+    "watchlistId",
+    "provisioningState",
+    "sasUri",
+    "watchlistCategory",
+    "watchlistKind",
+    "tenantId",
+    "created",
+    "updated",
+    "createdBy",
+    "updatedBy",
+    "isDeleted",
+    "uploadStatus",
+}
+
+# Watchlist item properties that are read-only / server-managed.
+_WATCHLIST_ITEM_STRIP_PROPS = {
+    "watchlistItemId",
+    "watchlistItemType",
+    "tenantId",
+    "created",
+    "updated",
+    "createdBy",
+    "updatedBy",
+    "isDeleted",
+}
+
+
+def _build_watchlist_body(backup: dict, items: list | None = None) -> dict:
+    """Build the PUT request body for a watchlist.
+
+    Keeps writable properties (displayName, itemsSearchKey, provider, source,
+    sourceType, description, labels, defaultDuration, numberOfLinesToSkip,
+    watchlistAlias, watchlistType).  Strips server-managed fields.
+
+    The API requires ``contentType`` to be non-empty.  If missing from the
+    backup, it is inferred from the ``source`` filename extension (``.tsv``
+    → ``text/tsv``, everything else → ``text/csv``).
+
+    When ``sourceType`` is ``"Local"`` and ``rawContent`` is absent (which is
+    the case for backups — the extractor doesn't save raw CSV), a full CSV/TSV
+    is generated from all watchlist items' ``itemsKeyValue`` data so the entire
+    watchlist (container + items) is uploaded in a single PUT request.
+    """
+    src_props: dict = backup.get("properties", {})
+    clean_props = {k: v for k, v in src_props.items() if k not in _WATCHLIST_STRIP_PROPS}
+
+    # Ensure contentType is present — the API rejects an empty value.
+    if not clean_props.get("contentType"):
+        source: str = clean_props.get("source", "")
+        clean_props["contentType"] = (
+            "text/tsv" if source.lower().endswith(".tsv") else "text/csv"
+        )
+
+    # When sourceType is "Local" the API demands rawContent.  Build full
+    # CSV/TSV from all items so everything is uploaded in one request.
+    if (
+        clean_props.get("sourceType", "").lower() == "local"
+        and not clean_props.get("rawContent")
+        and items
+    ):
+        # Derive column headers from the first item's keys
+        first_kv = items[0].get("properties", {}).get("itemsKeyValue", {})
+        header_keys = list(first_kv.keys())
+        if not header_keys:
+            search_key = clean_props.get("itemsSearchKey", "")
+            if search_key:
+                header_keys = [search_key]
+        if header_keys:
+            is_tsv = "tsv" in clean_props.get("contentType", "")
+            buf = io.StringIO()
+            writer = csv.writer(
+                buf,
+                delimiter="\t" if is_tsv else ",",
+                quoting=csv.QUOTE_MINIMAL,
+                lineterminator="\n",
+            )
+            writer.writerow(header_keys)
+            for item in items:
+                kv = item.get("properties", {}).get("itemsKeyValue", {})
+                writer.writerow([str(kv.get(k, "")) for k in header_keys])
+            clean_props["rawContent"] = buf.getvalue().rstrip("\n")
+
+    return {"properties": clean_props}
+
+
+def restore_watchlists(sentinel_base: str, headers: dict, input_root: Path, generate_new_id: bool = False) -> int:
+    """Restore Watchlists and their items from the Watchlists/ backup folder.
+
+    All items are embedded as CSV/TSV in the ``rawContent`` property of the
+    watchlist PUT request so the entire watchlist is uploaded in a single call.
+    This avoids per-item API requests and the throttling that comes with them.
+
+    PUT ``{sentinel_base}/watchlists/{watchlistAlias}``
+
+    Watchlists use human-readable aliases (not GUIDs) as their identifier,
+    so ``generate_new_id`` has no effect.
+    """
+    folder = input_root / "Watchlists"
+    files = load_json_files(folder)
+    if not files:
+        log.info("No Watchlist backup files found in: %s", folder)
+        return 0
+
+    log.info("Restoring %d Watchlist(s) from: %s", len(files), folder)
+    params = {"api-version": API_VERSION_WATCHLISTS}
+    restored = 0
+
+    for path, backup in files:
+        props = backup.get("properties", {})
+        watchlist_alias: str = props.get("watchlistAlias") or backup.get("name", "")
+        display_name: str = props.get("displayName") or watchlist_alias or path.stem
+
+        if not watchlist_alias:
+            log.warning("  Skipping %s \u2014 missing watchlist alias.", path.name)
+            continue
+
+        items: list = backup.get("watchlistItems", [])
+        log.info(
+            "  Restoring watchlist: %s  (alias: %s, %d items)",
+            display_name, watchlist_alias, len(items),
+        )
+
+        put_url = f"{sentinel_base}/watchlists/{watchlist_alias}"
+        body = _build_watchlist_body(backup, items=items)
+
+        try:
+            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=120)
+            resp.raise_for_status()
+            status = "created" if resp.status_code == 201 else "updated"
+            log.info("    -> watchlist %s (%d) with %d items", status, resp.status_code, len(items))
+            restored += 1
+        except requests.HTTPError as exc:
+            err_msg = ""
+            try:
+                err_msg = exc.response.json().get("error", {}).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            log.error(
+                "    -> HTTP %d for watchlist '%s': %s%s",
+                exc.response.status_code, display_name, exc,
+                f" \u2014 {err_msg}" if err_msg else "",
+            )
+        except requests.RequestException as exc:
+            log.error("    -> Request failed for watchlist '%s': %s", display_name, exc)
+
+    return restored
+
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -2159,7 +2314,7 @@ def main() -> None:
     # ── Watchlists ───────────────────────────────────────────────────────────
     if _wants(args, "watchlists"):
         try:
-            total_restored += restore_watchlists(sentinel_base, headers, input_root)
+            total_restored += restore_watchlists(sentinel_base, headers, input_root, args.generate_new_id)
         except requests.HTTPError as exc:
             log.error("Failed to restore Watchlists: %s", exc)
 

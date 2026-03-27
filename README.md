@@ -22,7 +22,6 @@ Restoration is supported for most of the above resource types. However, the foll
 
 | Resource Type | Restore Status |
 |---|---|
-| Watchlists | :x: Not implemented — coming in a future release |
 | Workbooks | :x: Not implemented — coming in a future release |
 | IAM Role Assignments | :x: Not implemented — coming in a future release |
 

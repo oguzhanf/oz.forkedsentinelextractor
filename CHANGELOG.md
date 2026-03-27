@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-03-27
+
+### Added
+
+- **Watchlist Restore** — Implemented `restore_watchlists()` in `sentinel_restore.py`. Watchlists and all their items are restored in a single PUT request per watchlist by embedding the full item data as CSV/TSV in the `rawContent` property. This avoids per-item API calls and the throttling that comes with thousands of individual requests.
+  - Automatically infers `contentType` (`text/csv` or `text/tsv`) from the source filename when missing from the backup.
+  - Generates proper RFC 4180-compliant CSV using Python's `csv` module, correctly handling values that contain commas, quotes, or newlines.
+  - Strips server-managed properties (`watchlistId`, `provisioningState`, `tenantId`, audit fields, etc.) from the PUT body.
+  - Updated `README.md` to reflect Watchlists as implemented for restore.
+
+---
+
 ## [Unreleased] - 2026-03-24
 
 ### Added
