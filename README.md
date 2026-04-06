@@ -59,6 +59,17 @@ Restoration is supported for most of the above resource types. However, the foll
 - **For Function App:** A deployed Azure Function App with a system-assigned Managed Identity enabled.
 - A `.env` file (or CLI arguments) supplying the required configuration values.
 
+### Required Outbound Access
+
+| FQDN | Why it is needed |
+|---|---|
+| `pypi.org` | Python package index used to resolve package metadata when running `pip install -r code/requirements.txt` or `pip install -r function_app/requirements.txt`. |
+| `files.pythonhosted.org` | Python package file host used to download package distributions when running `pip install -r code/requirements.txt` or `pip install -r function_app/requirements.txt`. |
+| `login.microsoftonline.com` | Microsoft Entra ID endpoint used to acquire access tokens for authenticated Azure operations. |
+| `management.azure.com` | Azure Resource Manager endpoint used to read, create, and update Azure and Microsoft Sentinel resources. |
+
+> **Note:** Access to `pypi.org` and `files.pythonhosted.org` is only needed while installing Python dependencies. After package installation is complete, those FQDNs can be disabled if your environment does not otherwise require Python package downloads.
+
 ### Authentication
 
 The extractor supports two authentication methods:
