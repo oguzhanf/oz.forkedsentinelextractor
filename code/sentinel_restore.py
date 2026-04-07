@@ -35,6 +35,14 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+import time
+
+# Optional: azure-identity for Managed Identity auth
+try:
+    from azure.identity import DefaultAzureCredential
+    _HAS_AZURE_IDENTITY = True
+except Exception:
+    _HAS_AZURE_IDENTITY = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,6 +103,56 @@ def get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     resp = requests.post(url, data=data, timeout=30)
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+
+# ---------------------------------------------------------------------------
+# Token manager
+# ---------------------------------------------------------------------------
+class TokenManager:
+    def __init__(self, tenant_id: str | None = None, client_id: str | None = None, client_secret: str | None = None, use_managed_identity: bool = False):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.use_managed_identity = use_managed_identity
+        self._token: str | None = None
+        self._expires_at: float | None = None
+
+    def _fetch_client_credentials(self) -> None:
+        url = AUTH_URL_TEMPLATE.format(tenant_id=self.tenant_id)
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": SCOPE,
+        }
+        resp = requests.post(url, data=data, timeout=30)
+        resp.raise_for_status()
+        d = resp.json()
+        self._token = d.get("access_token")
+        expires_in = int(d.get("expires_in", 3600))
+        self._expires_at = time.time() + expires_in
+
+    def _fetch_managed_identity(self) -> None:
+        if not _HAS_AZURE_IDENTITY:
+            raise ImportError("azure-identity is required for Managed Identity authentication.")
+        cred = DefaultAzureCredential()
+        at = cred.get_token(SCOPE)
+        self._token = at.token
+        try:
+            self._expires_at = float(at.expires_on)
+        except Exception:
+            self._expires_at = time.time() + 3600
+
+    def ensure_token(self) -> str:
+        if not self._token or not self._expires_at or (self._expires_at - time.time() < 300):
+            if self.use_managed_identity:
+                self._fetch_managed_identity()
+            else:
+                self._fetch_client_credentials()
+        return self._token  # type: ignore[return-value]
+
+    def refresh_headers(self, headers: dict) -> None:
+        headers["Authorization"] = f"Bearer {self.ensure_token()}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2463,20 +2521,28 @@ def main() -> None:
         cfg["target_workspace_name"],
     )
 
-    # Authenticate
+    # Authenticate using TokenManager so long-running restores can refresh tokens
     try:
-        token = get_access_token(cfg["tenant_id"], cfg["client_id"], cfg["client_secret"])
+        token_mgr = TokenManager(
+            tenant_id=cfg.get("tenant_id"),
+            client_id=cfg.get("client_id"),
+            client_secret=cfg.get("client_secret"),
+            use_managed_identity=False,
+        )
+        headers = {"Content-Type": "application/json"}
+        token_mgr.refresh_headers(headers)
         log.info("Authentication successful.")
     except requests.HTTPError as exc:
         log.error("Authentication failed: %s", exc)
         raise SystemExit(1) from exc
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
     total_restored = 0
+
+    # Ensure headers are fresh at Phase 1 start
+    try:
+        token_mgr.refresh_headers(headers)
+    except Exception:
+        pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # Phase 1 — Prerequisites
@@ -2525,6 +2591,12 @@ def main() -> None:
     # These may depend on Custom Tables, Content Packages, or Data Connectors
     # already being present in the target workspace.
     # ══════════════════════════════════════════════════════════════════════════
+
+    # Refresh Authorization header before Phase 2 (long-running puts ahead)
+    try:
+        token_mgr.refresh_headers(headers)
+    except Exception:
+        pass
 
     # ── Alert Rules ──────────────────────────────────────────────────────────
     if _wants(args, "alert-rules"):

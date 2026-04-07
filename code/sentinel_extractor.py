@@ -21,6 +21,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+import time
 
 # Optional: azure-identity for Managed Identity auth (used in Function App)
 try:
@@ -103,6 +104,70 @@ def get_access_token_managed_identity() -> str:
     token = credential.get_token("https://management.azure.com/.default")
     log.info("Access token acquired successfully (managed identity).")
     return token.token
+
+
+# ---------------------------------------------------------------------------
+# Token manager
+# ---------------------------------------------------------------------------
+class TokenManager:
+    """Simple token manager for client-credentials or managed identity.
+
+    - Caches token and expiry; proactively refreshes when less than 5 minutes
+      remains.
+    - Provides helper to refresh Authorization header in-place.
+    """
+
+    def __init__(self, tenant_id: str | None = None, client_id: str | None = None, client_secret: str | None = None, use_managed_identity: bool = False):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.use_managed_identity = use_managed_identity
+        self._token: str | None = None
+        self._expires_at: float | None = None
+
+    def _fetch_client_credentials(self) -> None:
+        url = TOKEN_URL_TEMPLATE.format(tenant_id=self.tenant_id)
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "https://management.azure.com/.default",
+        }
+        resp = requests.post(url, data=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data.get("access_token")
+        expires_in = int(data.get("expires_in", 3600))
+        self._expires_at = time.time() + expires_in
+        log.debug("Fetched new access token; expires_in=%s", expires_in)
+
+    def _fetch_managed_identity(self) -> None:
+        if not _HAS_AZURE_IDENTITY:
+            raise ImportError("azure-identity is required for Managed Identity authentication.")
+        credential = DefaultAzureCredential()
+        at = credential.get_token("https://management.azure.com/.default")
+        self._token = at.token
+        # azure.identity returns expires_on as int seconds since epoch
+        try:
+            self._expires_at = float(at.expires_on)
+        except Exception:
+            # Fallback: assume 1 hour
+            self._expires_at = time.time() + 3600
+
+    def ensure_token(self) -> str:
+        """Return a valid access token, refreshing proactively if needed."""
+        # Refresh if no token or less than 5 minutes left
+        if not self._token or not self._expires_at or (self._expires_at - time.time() < 300):
+            if self.use_managed_identity:
+                self._fetch_managed_identity()
+            else:
+                self._fetch_client_credentials()
+        return self._token  # type: ignore[return-value]
+
+    def refresh_headers(self, headers: dict) -> None:
+        """Ensure the supplied headers dict contains a fresh Authorization header."""
+        token = self.ensure_token()
+        headers["Authorization"] = f"Bearer {token}"
 
 
 # ---------------------------------------------------------------------------
@@ -1306,20 +1371,19 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
     # Load file tracker for change detection
     load_tracker(output_root)
 
-    # Authenticate
+    # Authenticate via TokenManager (supports managed identity or client creds)
     try:
-        if cfg.get("use_managed_identity"):
-            token = get_access_token_managed_identity()
-        else:
-            token = get_access_token(cfg["tenant_id"], cfg["client_id"], cfg["client_secret"])
+        token_mgr = TokenManager(
+            tenant_id=cfg.get("tenant_id"),
+            client_id=cfg.get("client_id"),
+            client_secret=cfg.get("client_secret"),
+            use_managed_identity=cfg.get("use_managed_identity", False),
+        )
+        headers = {"Content-Type": "application/json"}
+        token_mgr.refresh_headers(headers)
     except (requests.HTTPError, ImportError) as exc:
         log.error("Authentication failed: %s", exc)
         raise
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
 
     def _should_skip(flag_name: str) -> bool:
         return args_skip.get(flag_name, False) or cfg.get(flag_name, False)
@@ -1328,17 +1392,18 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
     summary: dict[str, str] = {}
 
     return _run_all_extractions(
-        cfg, sentinel_base, workspace_base, headers, output_root, _should_skip, total_saved, summary
+        cfg, sentinel_base, workspace_base, headers, output_root, _should_skip, total_saved, summary, token_mgr
     )
 
 
 def _run_all_extractions(
-    cfg, sentinel_base, workspace_base, headers, output_root, should_skip, total_saved, summary
+    cfg, sentinel_base, workspace_base, headers, output_root, should_skip, total_saved, summary, token_mgr
 ) -> dict:
     """Execute all extraction steps. Returns dict with total_saved and summary."""
 
     if not should_skip("skip_alert_rules"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_alert_rules(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Alert Rules"] = str(saved)
@@ -1351,6 +1416,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_automation_rules"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_automation_rules(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Automation Rules"] = str(saved)
@@ -1363,6 +1429,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_summary_rules"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_summary_rules(workspace_base, headers, output_root)
             total_saved += saved
             summary["Summary Rules"] = str(saved)
@@ -1375,6 +1442,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_hunting"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_hunting(sentinel_base, workspace_base, headers, output_root)
             total_saved += saved
             summary["Hunting"] = str(saved)
@@ -1387,6 +1455,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_workspace_functions"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_workspace_functions(workspace_base, headers, output_root)
             total_saved += saved
             summary["Workspace Functions"] = str(saved)
@@ -1399,6 +1468,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_saved_queries"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_saved_queries(workspace_base, headers, output_root)
             total_saved += saved
             summary["Saved Queries"] = str(saved)
@@ -1419,6 +1489,7 @@ def _run_all_extractions(
         dcr_rg = cfg.get("dcr_resource_group", "")
         if dcr_rg:
             try:
+                token_mgr.refresh_headers(headers)
                 saved = extract_dcrs(
                     cfg["subscription_id"],
                     dcr_rg,
@@ -1444,6 +1515,7 @@ def _run_all_extractions(
         dce_rg = cfg.get("dce_resource_group", "")
         if dce_rg:
             try:
+                token_mgr.refresh_headers(headers)
                 saved = extract_dces(
                     cfg["subscription_id"],
                     dce_rg,
@@ -1468,6 +1540,7 @@ def _run_all_extractions(
         wb_rg = cfg.get("workbooks_resource_group", "")
         if wb_rg:
             try:
+                token_mgr.refresh_headers(headers)
                 saved = extract_workbooks(
                     cfg["subscription_id"],
                     wb_rg,
@@ -1494,6 +1567,7 @@ def _run_all_extractions(
         la_rg = cfg.get("logic_apps_resource_group", "")
         if la_rg:
             try:
+                token_mgr.refresh_headers(headers)
                 saved = extract_logic_apps(cfg["subscription_id"], la_rg, headers, output_root)
                 total_saved += saved
                 summary["Logic Apps"] = str(saved)
@@ -1512,6 +1586,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_watchlists"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_watchlists(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Watchlists"] = str(saved)
@@ -1524,6 +1599,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_custom_tables"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_custom_tables(workspace_base, headers, output_root)
             total_saved += saved
             summary["Custom Tables"] = str(saved)
@@ -1536,6 +1612,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_table_retention"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_table_retention(workspace_base, headers, output_root)
             total_saved += saved
             summary["Table Retention"] = str(saved)
@@ -1548,6 +1625,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_content_packages"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_content_packages(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Content Packages"] = str(saved)
@@ -1560,6 +1638,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_data_connectors"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_data_connectors(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Data Connectors"] = str(saved)
@@ -1572,6 +1651,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_product_settings"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_product_settings(sentinel_base, headers, output_root)
             total_saved += saved
             summary["Product Settings"] = str(saved)
@@ -1584,6 +1664,7 @@ def _run_all_extractions(
 
     if not should_skip("skip_iam"):
         try:
+            token_mgr.refresh_headers(headers)
             saved = extract_iam_role_assignments(
                 cfg["subscription_id"],
                 cfg["resource_group"],
