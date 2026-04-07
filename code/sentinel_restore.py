@@ -1697,6 +1697,16 @@ def _build_custom_table_body(backup: dict) -> dict:
             and not col.get("isDefaultDisplay", False)
             and not col.get("isHidden", False)
         ]
+
+        # TimeGenerated is mandatory for all custom tables — ensure it is
+        # always present even when the backup schema omits it (e.g. DCR-based
+        # tables where the column list returned by the API can be empty).
+        has_time_generated = any(
+            col.get("name") == "TimeGenerated" for col in custom_columns
+        )
+        if not has_time_generated:
+            custom_columns.insert(0, {"name": "TimeGenerated", "type": "datetime"})
+
         clean_props["schema"] = {
             "name": schema.get("name", ""),
             "columns": custom_columns,
