@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-04-09
+
+### Added
+
+- **IAM Role Assignment Restore** — Implemented `restore_iam_role_assignments()` in `sentinel_restore.py`. Restores IAM role assignments from the `IAM/` backup folder to the target resource group via PUT to `Microsoft.Authorization/roleAssignments`.
+  - **Deduplication**: Fetches existing role assignments on the target resource group and skips any backup assignment whose `(principalId, roleDefinitionId)` combination already exists.
+  - **Scope filtering** via three CLI flags:
+    - `--iam-rg-scoped` (default): restores only assignments originally scoped to the resource group.
+    - `--iam-inherited`: restores only assignments inherited from parent scopes (subscription, management group), applied at the target RG scope.
+    - `--iam-full-permissions`: restores all assignments regardless of original scope.
+  - **Cross-subscription support**: rewrites `roleDefinitionId` to reference the target subscription.
+  - **Safety**: `--restore-iam` is deliberately excluded from `--restore-all` and must be explicitly requested.
+  - Strips server-managed properties (`createdOn`, `updatedOn`, `createdBy`, `updatedBy`, `scope`) from the PUT body.
+  - Supports `--generate-new-id` for fresh assignment name GUIDs.
+  - Requires **User Access Administrator** role on the target resource group.
+
+---
+
 ## [Unreleased] - 2026-03-28
 
 ### Added

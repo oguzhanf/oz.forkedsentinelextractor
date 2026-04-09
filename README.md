@@ -18,11 +18,9 @@ Alert Rules, Automation Rules, Summary Rules, Hunting Queries, Workspace Functio
 
 ### Restoration
 
-Restoration is supported for most of the above resource types. However, the following are **not yet implemented** for restore and are planned for future releases:
+Restoration is supported for all of the above resource types.
 
-| Resource Type | Restore Status |
-|---|---|
-| IAM Role Assignments | :x: Not implemented — coming in a future release |
+> **Note:** IAM Role Assignments require the explicit `--restore-iam` flag and are **not** included in `--restore-all` for safety. See [IAM Restore](#iam-role-assignment-restore) below.
 
 ## Project Structure
 
@@ -103,6 +101,7 @@ The App Registration (service principal) must be granted Azure RBAC roles on the
 | **Contributor** | Target DCR resource group | Create/update Data Collection Rules |
 | **Contributor** | Target DCE resource group | Create/update Data Collection Endpoints |
 | **Contributor** | Target Workbooks resource group | Create/update workbooks |
+| **User Access Administrator** | Target workspace resource group | Create/update IAM role assignments (only needed with `--restore-iam`) |
 
 > **Tip:** For a quick start, assign **Contributor** + **Microsoft Sentinel Contributor** at the subscription level. For production, scope roles to the specific resource groups used by each resource type.
 

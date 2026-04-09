@@ -86,6 +86,7 @@ API_VERSION_HUNTING_QUERIES      = "2025-07-01"
 API_VERSION_THREAT_INTELLIGENCE  = "2025-07-01-preview"
 API_VERSION_WATCHLISTS           = "2025-07-01-preview"
 API_VERSION_ML_ANALYTICS         = "2025-07-01-preview"
+API_VERSION_IAM                  = "2022-04-01"
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -2311,6 +2312,247 @@ def restore_ml_analytics_settings(
     return restored
 
 # ---------------------------------------------------------------------------
+# IAM Role Assignments
+# ---------------------------------------------------------------------------
+
+# Scope-mode constants for IAM restore
+IAM_SCOPE_RG_SCOPED = "rg-scoped"
+IAM_SCOPE_INHERITED = "inherited"
+IAM_SCOPE_FULL      = "full"
+
+# Properties that are read-only / server-managed and must NOT be sent in PUT.
+_IAM_STRIP_PROPS = {
+    "createdOn",
+    "updatedOn",
+    "createdBy",
+    "updatedBy",
+    "scope",
+}
+
+
+def _build_iam_body(backup: dict, target_subscription_id: str = "") -> dict:
+    """Build the PUT request body for an IAM role assignment.
+
+    Strips server-managed properties and rewrites the ``roleDefinitionId``
+    to reference the *target_subscription_id* when doing cross-subscription
+    restores.  The PUT body for ``Microsoft.Authorization/roleAssignments``
+    only needs a ``properties`` object with ``roleDefinitionId``,
+    ``principalId``, and optionally ``principalType``, ``condition``,
+    ``conditionVersion``, ``description``, and
+    ``delegatedManagedIdentityResourceId``.
+    """
+    src_props: dict = backup.get("properties", {})
+    clean_props = {k: v for k, v in src_props.items() if k not in _IAM_STRIP_PROPS}
+
+    # Rewrite roleDefinitionId to target subscription when doing cross-sub restore
+    role_def_id: str = clean_props.get("roleDefinitionId", "")
+    if target_subscription_id and role_def_id:
+        # Format: /subscriptions/{sub}/providers/Microsoft.Authorization/roleDefinitions/{guid}
+        match = re.match(
+            r"^/subscriptions/[^/]+(/providers/Microsoft\.Authorization/roleDefinitions/.+)$",
+            role_def_id,
+            re.IGNORECASE,
+        )
+        if match:
+            clean_props["roleDefinitionId"] = (
+                f"/subscriptions/{target_subscription_id}{match.group(1)}"
+            )
+
+    # Remove null-valued optional fields (API may reject explicit nulls)
+    for key in ("condition", "conditionVersion", "delegatedManagedIdentityResourceId", "description"):
+        if key in clean_props and clean_props[key] is None:
+            del clean_props[key]
+
+    return {"properties": clean_props}
+
+
+def _role_definition_guid(role_definition_id: str) -> str:
+    """Extract the trailing GUID from a roleDefinitionId path."""
+    return role_definition_id.rsplit("/", 1)[-1].lower() if role_definition_id else ""
+
+
+def _fetch_existing_iam_assignments(
+    subscription_id: str,
+    resource_group: str,
+    headers: dict,
+) -> set[tuple[str, str]]:
+    """Fetch all IAM role assignments on the target RG and return a dedup set.
+
+    Returns a set of ``(principalId, roleDefinitionGUID)`` tuples (both
+    lowercased) so callers can quickly check whether a backup assignment
+    already exists on the target.  Follows ``nextLink`` for pagination.
+    """
+    url: str | None = (
+        f"{MANAGEMENT_BASE}/subscriptions/{subscription_id}"
+        f"/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.Authorization/roleAssignments"
+    )
+    params: dict | None = {"api-version": API_VERSION_IAM}
+    existing: set[tuple[str, str]] = set()
+
+    while url:
+        resp = authenticated_request("get", url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("value", []):
+            props = item.get("properties", {})
+            principal_id = (props.get("principalId") or "").lower()
+            role_guid = _role_definition_guid(props.get("roleDefinitionId", ""))
+            if principal_id and role_guid:
+                existing.add((principal_id, role_guid))
+        url = data.get("nextLink")
+        params = None  # nextLink already contains query params
+
+    return existing
+
+
+def restore_iam_role_assignments(
+    subscription_id: str,
+    resource_group: str,
+    headers: dict,
+    input_root: Path,
+    generate_new_id: bool = False,
+    iam_scope_mode: str = IAM_SCOPE_RG_SCOPED,
+) -> int:
+    """Restore IAM role assignments from the IAM/ backup folder.
+
+    Each JSON file is PUT to:
+        PUT /subscriptions/{sub}/resourceGroups/{rg}/providers/
+            Microsoft.Authorization/roleAssignments/{name}
+
+    The function first fetches all existing role assignments on the target
+    resource group and **skips** any backup assignment whose
+    ``(principalId, roleDefinitionId)`` combination already exists.  This
+    ensures only *missing* permissions are added.
+
+    Scope filtering (controlled by *iam_scope_mode*):
+
+    - ``rg-scoped`` (default): only assignments whose original scope is the
+      resource-group level are restored.
+    - ``inherited``: only assignments whose original scope is *above* the
+      resource group (subscription, management group) are restored — applied
+      at the target resource-group scope.
+    - ``full``: all assignments are restored regardless of their original
+      scope, applied at the target resource-group scope.
+    """
+    folder = input_root / "IAM"
+    files = load_json_files(folder)
+    if not files:
+        log.info("No IAM role assignment backup files found in: %s", folder)
+        return 0
+
+    log.info("Restoring IAM role assignments from: %s  (scope mode: %s)", folder, iam_scope_mode)
+
+    # Build the expected RG scope path for filtering
+    rg_scope_prefix = (
+        f"/subscriptions/{subscription_id}"
+        f"/resourceGroups/{resource_group}"
+    ).lower()
+
+    # ── Scope filtering ─────────────────────────────────────────────────────
+    filtered: list[tuple[Path, dict]] = []
+    for path, backup in files:
+        original_scope = (backup.get("properties", {}).get("scope") or "").lower()
+        is_rg_scoped = original_scope.rstrip("/") == rg_scope_prefix.rstrip("/") or (
+            original_scope.startswith(rg_scope_prefix)
+            and len(original_scope) > len(rg_scope_prefix)
+            and original_scope[len(rg_scope_prefix)] == "/"
+        )
+
+        if iam_scope_mode == IAM_SCOPE_RG_SCOPED and not is_rg_scoped:
+            log.debug("  Skipping %s — scope '%s' is not RG-scoped (use --iam-inherited or --iam-full-permissions)", path.name, original_scope)
+            continue
+        if iam_scope_mode == IAM_SCOPE_INHERITED and is_rg_scoped:
+            log.debug("  Skipping %s — scope '%s' is RG-scoped (use --iam-rg-scoped or --iam-full-permissions)", path.name, original_scope)
+            continue
+        # IAM_SCOPE_FULL: no filtering
+        filtered.append((path, backup))
+
+    if not filtered:
+        log.info("No IAM role assignments match the '%s' scope filter. Nothing to restore.", iam_scope_mode)
+        return 0
+
+    log.info("  %d of %d backup assignment(s) match the '%s' scope filter.", len(filtered), len(files), iam_scope_mode)
+
+    # ── Fetch existing assignments on target RG ─────────────────────────────
+    log.info("  Fetching existing role assignments on target resource group …")
+    try:
+        existing = _fetch_existing_iam_assignments(subscription_id, resource_group, headers)
+        log.info("  Found %d existing assignment(s) on target.", len(existing))
+    except requests.RequestException as exc:
+        log.error("  Could not fetch existing IAM assignments: %s — aborting IAM restore.", exc)
+        return 0
+
+    params = {"api-version": API_VERSION_IAM}
+    restored = 0
+
+    for path, backup in filtered:
+        original_name: str = backup.get("name", "")
+        props = backup.get("properties", {})
+        principal_type: str = props.get("principalType", "")
+        principal_id: str = props.get("principalId", "")
+        role_def_id: str = props.get("roleDefinitionId", "")
+        display_name: str = (
+            f"{principal_type}_{principal_id[:8]}"
+            if principal_type and principal_id
+            else original_name or path.stem
+        )
+
+        if not original_name:
+            log.warning("  Skipping %s — missing 'name' field.", path.name)
+            continue
+        if not principal_id or not role_def_id:
+            log.warning("  Skipping %s — missing principalId or roleDefinitionId.", path.name)
+            continue
+
+        # ── Dedup check ─────────────────────────────────────────────────────
+        dedup_key = (principal_id.lower(), _role_definition_guid(role_def_id))
+        if dedup_key in existing:
+            log.info("  Skipping %s — assignment already exists on target (principal=%s, role=%s).",
+                     display_name, principal_id[:8], dedup_key[1][:8])
+            continue
+
+        # ── Build PUT request ───────────────────────────────────────────────
+        assignment_name = str(uuid.uuid4()) if generate_new_id else original_name
+        if generate_new_id:
+            log.info("  Restoring: %s  original id: %s  -> new id: %s", display_name, original_name, assignment_name)
+        else:
+            log.info("  Restoring: %s  (id: %s)", display_name, assignment_name)
+
+        put_url = (
+            f"{MANAGEMENT_BASE}/subscriptions/{subscription_id}"
+            f"/resourceGroups/{resource_group}"
+            f"/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+        )
+        body = _build_iam_body(backup, target_subscription_id=subscription_id)
+
+        try:
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
+            resp.raise_for_status()
+            status = "created" if resp.status_code == 201 else "updated"
+            log.info("    -> %s (%d) with id: %s", status, resp.status_code, assignment_name)
+            restored += 1
+            # Add to existing set so subsequent files with the same principal+role are deduplicated
+            existing.add(dedup_key)
+        except requests.HTTPError as exc:
+            err_msg = ""
+            try:
+                err_msg = exc.response.json().get("error", {}).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            log.error(
+                "    -> HTTP %d for '%s': %s%s",
+                exc.response.status_code,
+                display_name,
+                exc,
+                f" — {err_msg}" if err_msg else "",
+            )
+        except requests.RequestException as exc:
+            log.error("    -> Request failed for '%s': %s", display_name, exc)
+
+    return restored
+
+# ---------------------------------------------------------------------------
 # CLI / config
 # ---------------------------------------------------------------------------
 
@@ -2408,6 +2650,32 @@ def parse_args() -> argparse.Namespace:
     what.add_argument("--restore-content-packages", action="store_true", help="Restore (install) Content Packages")
     what.add_argument("--restore-threat-intelligence", action="store_true", help="Restore Threat Intelligence indicators")
     what.add_argument("--restore-ml-analytics", action="store_true", help="Restore Security ML Analytics Settings")
+    what.add_argument(
+        "--restore-iam", action="store_true",
+        help=(
+            "Restore IAM role assignments. This is NOT included in --restore-all "
+            "for safety — IAM changes are security-sensitive and must be explicitly requested."
+        ),
+    )
+
+    # ── IAM scope options ───────────────────────────────────────────────────
+    iam_opts = parser.add_argument_group(
+        "IAM scope options",
+        "Control which backup IAM assignments are restored based on their original scope. "
+        "Default is --iam-rg-scoped (safest). These flags are only used with --restore-iam.",
+    )
+    iam_opts.add_argument(
+        "--iam-rg-scoped", action="store_true",
+        help="Restore only assignments scoped directly to the resource group (default)",
+    )
+    iam_opts.add_argument(
+        "--iam-inherited", action="store_true",
+        help="Restore only assignments inherited from parent scopes (subscription, management group)",
+    )
+    iam_opts.add_argument(
+        "--iam-full-permissions", action="store_true",
+        help="Restore all assignments (RG-scoped + inherited), all applied at the target RG scope",
+    )
 
     # ── Logic App restore mode ──────────────────────────────────────────────
     parser.add_argument(
@@ -2541,6 +2809,7 @@ def main() -> None:
         "dcr", "dce", "workbooks", "logic_apps", "custom_tables",
         "table_retention", "product_settings", "data_connectors",
         "content_packages", "threat_intelligence", "ml_analytics",
+        "iam",
     ]
     if not args.restore_all and not any(getattr(args, f"restore_{f}") for f in restore_flags):
         log.error(
@@ -2801,6 +3070,29 @@ def main() -> None:
             total_restored += restore_ml_analytics_settings(sentinel_base, headers, input_root, args.generate_new_id)
         except requests.HTTPError as exc:
             log.error("Failed to restore ML Analytics Settings: %s", exc)
+
+    # ── IAM Role Assignments ────────────────────────────────────────────────
+    # IAM is deliberately excluded from --restore-all for safety.
+    # It must be explicitly requested with --restore-iam.
+    if args.restore_iam:
+        # Determine scope mode — default to rg-scoped when none specified
+        if args.iam_full_permissions:
+            iam_scope_mode = IAM_SCOPE_FULL
+        elif args.iam_inherited:
+            iam_scope_mode = IAM_SCOPE_INHERITED
+        else:
+            iam_scope_mode = IAM_SCOPE_RG_SCOPED
+        try:
+            total_restored += restore_iam_role_assignments(
+                cfg["target_subscription_id"],
+                cfg["target_resource_group"],
+                headers,
+                input_root,
+                generate_new_id=args.generate_new_id,
+                iam_scope_mode=iam_scope_mode,
+            )
+        except requests.HTTPError as exc:
+            log.error("Failed to restore IAM role assignments: %s", exc)
 
     log.info("Restore complete. Total items restored: %d", total_restored)
 
