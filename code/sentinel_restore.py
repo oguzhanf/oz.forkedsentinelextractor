@@ -105,6 +105,9 @@ def get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return resp.json()["access_token"]
 
 
+_REQUEST_TOKEN_MANAGER: TokenManager | None = None
+
+
 # ---------------------------------------------------------------------------
 # Token manager
 # ---------------------------------------------------------------------------
@@ -116,6 +119,7 @@ class TokenManager:
         self.use_managed_identity = use_managed_identity
         self._token: str | None = None
         self._expires_at: float | None = None
+        self._credential = DefaultAzureCredential() if use_managed_identity and _HAS_AZURE_IDENTITY else None
 
     def _fetch_client_credentials(self) -> None:
         url = AUTH_URL_TEMPLATE.format(tenant_id=self.tenant_id)
@@ -135,7 +139,7 @@ class TokenManager:
     def _fetch_managed_identity(self) -> None:
         if not _HAS_AZURE_IDENTITY:
             raise ImportError("azure-identity is required for Managed Identity authentication.")
-        cred = DefaultAzureCredential()
+        cred = self._credential or DefaultAzureCredential()
         at = cred.get_token(SCOPE)
         self._token = at.token
         try:
@@ -143,16 +147,63 @@ class TokenManager:
         except Exception:
             self._expires_at = time.time() + 3600
 
-    def ensure_token(self) -> str:
-        if not self._token or not self._expires_at or (self._expires_at - time.time() < 300):
+    def ensure_token(self, force_refresh: bool = False) -> str:
+        if force_refresh or not self._token or not self._expires_at or (self._expires_at - time.time() < 300):
             if self.use_managed_identity:
                 self._fetch_managed_identity()
             else:
                 self._fetch_client_credentials()
         return self._token  # type: ignore[return-value]
 
-    def refresh_headers(self, headers: dict) -> None:
-        headers["Authorization"] = f"Bearer {self.ensure_token()}"
+    def refresh_headers(self, headers: dict, force_refresh: bool = False) -> None:
+        headers["Authorization"] = f"Bearer {self.ensure_token(force_refresh=force_refresh)}"
+
+
+def set_request_token_manager(token_manager: TokenManager | None) -> None:
+    global _REQUEST_TOKEN_MANAGER
+    _REQUEST_TOKEN_MANAGER = token_manager
+
+
+def _is_auth_failure_response(response: requests.Response) -> bool:
+    if response.status_code == 401:
+        return True
+    if response.status_code != 403:
+        return False
+
+    error_code = ""
+    error_message = ""
+    try:
+        error = response.json().get("error", {})
+        error_code = str(error.get("code", "")).lower()
+        error_message = str(error.get("message", "")).lower()
+    except ValueError:
+        error_message = response.text.lower()
+
+    auth_markers = (
+        "token",
+        "unauthorized",
+        "authentication",
+        "expired",
+        "invalid issuer",
+    )
+    return any(marker in error_code or marker in error_message for marker in auth_markers)
+
+
+def authenticated_request(method: str, url: str, *, headers: dict | None = None, retry_on_auth_failure: bool = True, **kwargs) -> requests.Response:
+    request_headers = dict(headers or {})
+    if _REQUEST_TOKEN_MANAGER is not None:
+        _REQUEST_TOKEN_MANAGER.refresh_headers(request_headers)
+
+    response = requests.request(method, url, headers=request_headers, **kwargs)
+    if retry_on_auth_failure and _REQUEST_TOKEN_MANAGER is not None and _is_auth_failure_response(response):
+        log.warning("Authentication token expired during restore; retrying %s %s with a refreshed token.", method.upper(), url)
+        _REQUEST_TOKEN_MANAGER.refresh_headers(request_headers, force_refresh=True)
+        response = requests.request(method, url, headers=request_headers, **kwargs)
+
+    if headers is not None and "Authorization" in request_headers:
+        headers["Authorization"] = request_headers["Authorization"]
+
+    return response
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -234,7 +285,7 @@ def restore_automation_rules(sentinel_base: str, headers: dict, input_root: Path
         body = _build_automation_rule_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -341,7 +392,8 @@ def restore_alert_rules(sentinel_base: str, headers: dict, input_root: Path, gen
         _MAX_UUID_RETRIES = 5
         for attempt in range(1, _MAX_UUID_RETRIES + 1):
             try:
-                resp = requests.put(
+                resp = authenticated_request(
+                    "put",
                     f"{sentinel_base}/alertRules/{rule_id}",
                     headers=headers, params=params, json=body, timeout=30,
                 )
@@ -460,7 +512,8 @@ def restore_summary_rules(workspace_base: str, headers: dict, input_root: Path, 
         _MAX_UUID_RETRIES = 5
         for attempt in range(1, _MAX_UUID_RETRIES + 1):
             try:
-                resp = requests.put(
+                resp = authenticated_request(
+                    "put",
                     f"{workspace_base}/summaryLogs/{rule_id}",
                     headers=headers, params=params, json=body, timeout=30,
                 )
@@ -607,7 +660,7 @@ def restore_hunting(
         body = _build_hunting_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -657,7 +710,7 @@ def restore_hunting(
                 q_body = {"properties": q_props}
                 q_url = f"{workspace_base}/savedSearches/{ss_id}"
                 try:
-                    resp = requests.put(q_url, headers=headers, params=query_params, json=q_body, timeout=30)
+                    resp = authenticated_request("put", q_url, headers=headers, params=query_params, json=q_body, timeout=30)
                     resp.raise_for_status()
                     log.info("      -> query restored (%d)", resp.status_code)
                     restored_query_ids.add(ss_id)
@@ -703,7 +756,7 @@ def restore_hunting(
                 }
 
                 rel_url = f"{sentinel_base}/hunts/{hunt_id}/relations/{relation_id}"
-                resp = requests.put(rel_url, headers=headers, params=params, json=rel_body, timeout=30)
+                resp = authenticated_request("put", rel_url, headers=headers, params=params, json=rel_body, timeout=30)
                 resp.raise_for_status()
                 log.info("      -> relation %s restored (%d)", relation_id, resp.status_code)
             except requests.HTTPError as exc:
@@ -783,7 +836,7 @@ def restore_workspace_functions(
         body = _build_workspace_function_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d) with id: %s", status, resp.status_code, original_id)
@@ -943,7 +996,7 @@ def restore_watchlists(sentinel_base: str, headers: dict, input_root: Path, gene
         body = _build_watchlist_body(backup, items=items)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=120)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=120)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> watchlist %s (%d) with %d items", status, resp.status_code, len(items))
@@ -1077,7 +1130,7 @@ def restore_dcrs(
         body = _build_dcr_body(backup, target_location=target_location, target_workspace_resource_id=target_workspace_resource_id)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d) with name: %s", status, resp.status_code, dcr_name)
@@ -1199,7 +1252,7 @@ def restore_dces(
         body = _build_dce_body(backup, target_location=target_location)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d) with name: %s", status, resp.status_code, dce_name)
@@ -1366,7 +1419,7 @@ def restore_workbooks(
         )
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=60)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=60)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -1547,7 +1600,7 @@ def _get_resource_group_location(
         f"{MANAGEMENT_BASE}/subscriptions/{subscription_id}"
         f"/resourcegroups/{resource_group}"
     )
-    resp = requests.get(url, headers=headers, params={"api-version": "2021-04-01"}, timeout=30)
+    resp = authenticated_request("get", url, headers=headers, params={"api-version": "2021-04-01"}, timeout=30)
     resp.raise_for_status()
     return resp.json().get("location", "")
 
@@ -1630,7 +1683,7 @@ def restore_logic_apps(
         )
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d) with name: %s", status, resp.status_code, app_name)
@@ -1755,7 +1808,7 @@ def restore_custom_tables(workspace_base: str, headers: dict, input_root: Path) 
         body = _build_custom_table_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=60)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=60)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -1834,7 +1887,7 @@ def restore_table_retention(workspace_base: str, headers: dict, input_root: Path
         body = {"properties": props}
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=60)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=60)
             resp.raise_for_status()
             log.info("    -> updated (%d)", resp.status_code)
             restored += 1
@@ -1908,7 +1961,7 @@ def restore_product_settings(sentinel_base: str, headers: dict, input_root: Path
         body = _build_product_setting_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             log.info("    -> updated (%d)", resp.status_code)
             restored += 1
@@ -1995,7 +2048,7 @@ def restore_data_connectors(sentinel_base: str, headers: dict, input_root: Path,
         body = _build_data_connector_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -2063,7 +2116,7 @@ def restore_content_packages(sentinel_base: str, headers: dict, input_root: Path
             body["properties"] = dict(backup["properties"])
 
         try:
-            resp = requests.post(post_url, headers=headers, params=params, json=body, timeout=60)
+            resp = authenticated_request("post", post_url, headers=headers, params=params, json=body, timeout=60)
             resp.raise_for_status()
             log.info("    -> installed (%d)", resp.status_code)
             restored += 1
@@ -2142,7 +2195,7 @@ def restore_threat_intelligence(sentinel_base: str, headers: dict, input_root: P
         body = _build_ti_indicator_body(backup)
 
         try:
-            resp = requests.post(post_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("post", post_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "uploaded"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -2234,7 +2287,7 @@ def restore_ml_analytics_settings(
         body = _build_ml_analytics_body(backup)
 
         try:
-            resp = requests.put(put_url, headers=headers, params=params, json=body, timeout=30)
+            resp = authenticated_request("put", put_url, headers=headers, params=params, json=body, timeout=30)
             resp.raise_for_status()
             status = "created" if resp.status_code == 201 else "updated"
             log.info("    -> %s (%d)", status, resp.status_code)
@@ -2540,6 +2593,7 @@ def main() -> None:
             use_managed_identity=False,
         )
         headers = {"Content-Type": "application/json"}
+        set_request_token_manager(token_mgr)
         token_mgr.refresh_headers(headers)
         log.info("Authentication successful.")
     except requests.HTTPError as exc:
