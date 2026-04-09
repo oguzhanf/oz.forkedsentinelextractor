@@ -1285,6 +1285,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip extraction of Security ML Analytics Settings",
     )
+    parser.add_argument("--only-alert-rules", action="store_true", help="Extract only alert rules")
+    parser.add_argument("--only-automation-rules", action="store_true", help="Extract only automation rules")
+    parser.add_argument("--only-summary-rules", action="store_true", help="Extract only summary rules")
+    parser.add_argument("--only-hunting", action="store_true", help="Extract only hunting")
+    parser.add_argument("--only-workspace-functions", action="store_true", help="Extract only workspace functions (parsers)")
+    parser.add_argument("--only-saved-queries", action="store_true", help="Extract only saved queries")
+    parser.add_argument("--only-dcr", action="store_true", help="Extract only Data Collection Rules")
+    parser.add_argument("--only-dce", action="store_true", help="Extract only Data Collection Endpoints")
+    parser.add_argument("--only-workbooks", action="store_true", help="Extract only Workbooks")
+    parser.add_argument("--only-logic-apps", action="store_true", help="Extract only Logic Apps")
+    parser.add_argument("--only-watchlists", action="store_true", help="Extract only Watchlists")
+    parser.add_argument("--only-custom-tables", action="store_true", help="Extract only custom tables")
+    parser.add_argument("--only-table-retention", action="store_true", help="Extract only table retention settings")
+    parser.add_argument("--only-content-packages", action="store_true", help="Extract only content packages (solutions)")
+    parser.add_argument("--only-data-connectors", action="store_true", help="Extract only data connectors")
+    parser.add_argument("--only-product-settings", action="store_true", help="Extract only product settings")
+    parser.add_argument("--only-iam", action="store_true", help="Extract only IAM role assignments")
+    parser.add_argument("--only-threat-intelligence", action="store_true", help="Extract only threat intelligence indicators")
+    parser.add_argument("--only-ml-analytics", action="store_true", help="Extract only Security ML Analytics Settings")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
@@ -1358,6 +1377,7 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
     if cfg_overrides is not None:
         cfg = cfg_overrides
         args_skip = {}  # no skip flags by default
+        args_only = {}  # no only flags by default
         output_dir = cfg.get("output_dir", "output")
         debug = cfg.get("debug", False)
         filename_uid = cfg.get("filename_uid", False)
@@ -1391,6 +1411,27 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
             "skip_iam": args.skip_iam,
             "skip_threat_intelligence": args.skip_threat_intelligence,
             "skip_ml_analytics": args.skip_ml_analytics,
+        }
+        args_only = {
+            "only_alert_rules": args.only_alert_rules,
+            "only_automation_rules": args.only_automation_rules,
+            "only_summary_rules": args.only_summary_rules,
+            "only_hunting": args.only_hunting,
+            "only_workspace_functions": args.only_workspace_functions,
+            "only_saved_queries": args.only_saved_queries,
+            "only_dcr": args.only_dcr,
+            "only_dce": args.only_dce,
+            "only_workbooks": args.only_workbooks,
+            "only_logic_apps": args.only_logic_apps,
+            "only_watchlists": args.only_watchlists,
+            "only_custom_tables": args.only_custom_tables,
+            "only_table_retention": args.only_table_retention,
+            "only_content_packages": args.only_content_packages,
+            "only_data_connectors": args.only_data_connectors,
+            "only_product_settings": args.only_product_settings,
+            "only_iam": args.only_iam,
+            "only_threat_intelligence": args.only_threat_intelligence,
+            "only_ml_analytics": args.only_ml_analytics,
         }
 
     if debug:
@@ -1446,7 +1487,38 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
         log.error("Authentication failed: %s", exc)
         raise
 
+    only_targets = [
+        "alert_rules",
+        "automation_rules",
+        "summary_rules",
+        "hunting",
+        "workspace_functions",
+        "saved_queries",
+        "dcr",
+        "dce",
+        "workbooks",
+        "logic_apps",
+        "watchlists",
+        "custom_tables",
+        "table_retention",
+        "content_packages",
+        "data_connectors",
+        "product_settings",
+        "iam",
+        "threat_intelligence",
+        "ml_analytics",
+    ]
+    selected_only = {
+        name for name in only_targets
+        if args_only.get(f"only_{name}", False) or cfg.get(f"only_{name}", False)
+    }
+    if selected_only:
+        log.info("Only mode enabled for: %s", ", ".join(sorted(selected_only)))
+
     def _should_skip(flag_name: str) -> bool:
+        target = flag_name[5:] if flag_name.startswith("skip_") else flag_name
+        if selected_only and target not in selected_only:
+            return True
         return args_skip.get(flag_name, False) or cfg.get(flag_name, False)
 
     total_saved = 0

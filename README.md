@@ -189,6 +189,12 @@ Skip specific resource types:
 python code/sentinel_extractor.py --skip-alert-rules --skip-watchlists
 ```
 
+Extract only specific resource types (you can combine multiple `--only-*` flags):
+
+```bash
+python code/sentinel_extractor.py --only-ml-analytics
+```
+
 Override `.env` values via CLI:
 
 ```bash
