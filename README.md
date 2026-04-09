@@ -177,6 +177,12 @@ Extract to a custom output directory:
 python code/sentinel_extractor.py --output-dir ./my-backup
 ```
 
+Force UID-suffixed filenames for Windows-safe backups when resource names are very long:
+
+```bash
+python code/sentinel_extractor.py --filename-uid
+```
+
 Skip specific resource types:
 
 ```bash

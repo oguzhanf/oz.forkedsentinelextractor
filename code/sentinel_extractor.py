@@ -16,6 +16,7 @@ import json
 import shutil
 import logging
 import argparse
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -177,6 +178,10 @@ class TokenManager:
 # Module-level state for file change tracking
 _file_tracker: dict = {}
 _tracker_path: Path | None = None
+_filename_uid_mode = False
+
+MAX_FILENAME_LENGTH = 255
+UID_SUFFIX_LENGTH = 16
 
 
 def load_tracker(output_root: Path) -> None:
@@ -198,6 +203,12 @@ def persist_tracker() -> None:
         )
 
 
+def set_filename_uid_mode(enabled: bool) -> None:
+    """Configure whether filenames should always include a stable UID suffix."""
+    global _filename_uid_mode
+    _filename_uid_mode = enabled
+
+
 def _backup_file(file_path: Path) -> None:
     """Move an existing file to older_versions/ with a timestamp suffix."""
     older_dir = file_path.parent / "older_versions"
@@ -206,7 +217,9 @@ def _backup_file(file_path: Path) -> None:
     stem = file_path.stem
     ext = file_path.suffix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"{stem}_{timestamp}{ext}"
+    backup_suffix = f"_{timestamp}{ext}"
+    trimmed_stem = _trim_filename_stem(stem, MAX_FILENAME_LENGTH - len(backup_suffix))
+    backup_name = f"{trimmed_stem}{backup_suffix}"
     backup_path = older_dir / backup_name
 
     shutil.move(str(file_path), str(backup_path))
@@ -222,6 +235,40 @@ def safe_filename(name: str) -> str:
     if not sanitized:
         sanitized = "unnamed"
     return sanitized
+
+
+def resource_filename_uid(resource_id: str) -> str:
+    """Return a stable short UID for a resource identifier."""
+    return hashlib.sha1(resource_id.encode("utf-8")).hexdigest()[:UID_SUFFIX_LENGTH]
+
+
+def _trim_filename_stem(stem: str, max_length: int) -> str:
+    """Trim a filename stem while preserving Windows filename constraints."""
+    if max_length <= 0:
+        return "unnamed"
+    trimmed = stem[:max_length].rstrip(" ._")
+    return trimmed or "unnamed"
+
+
+def build_resource_filename(display_name: str, resource_id: str, extension: str = ".json") -> str:
+    """Build a safe, unique filename that fits within Windows component limits."""
+    sanitized = safe_filename(display_name)
+    uid = resource_filename_uid(resource_id)
+    uid_suffix = f"_{uid}"
+    max_stem_length = MAX_FILENAME_LENGTH - len(extension)
+
+    if _filename_uid_mode:
+        prefix_budget = max_stem_length - len(uid_suffix)
+        prefix = _trim_filename_stem(sanitized, prefix_budget)
+        return f"{prefix}{uid_suffix}{extension}"
+
+    candidate = f"{sanitized}{extension}"
+    if len(candidate) <= MAX_FILENAME_LENGTH:
+        return candidate
+
+    prefix_budget = max_stem_length - len(uid_suffix)
+    prefix = _trim_filename_stem(sanitized, prefix_budget)
+    return f"{prefix}{uid_suffix}{extension}"
 
 
 def get_paginated(url: str, headers: dict, params: dict) -> list:
@@ -250,7 +297,7 @@ def get_paginated(url: str, headers: dict, params: dict) -> list:
 
 def save_json(folder: Path, display_name: str, rule_id: str, data: dict) -> bool:
     """Save a rule dict as a JSON file. Returns True if file was written (new/changed)."""
-    filename = safe_filename(display_name) + ".json"
+    filename = build_resource_filename(display_name, rule_id)
     output_path = folder / filename
     new_content = json.dumps(data, indent=2, ensure_ascii=False)
 
@@ -258,11 +305,12 @@ def save_json(folder: Path, display_name: str, rule_id: str, data: dict) -> bool
     tracker_key = f"{folder.name}/{rule_id}"
     prev_entry = _file_tracker.get(tracker_key)
     if prev_entry:
-        output_path = folder / prev_entry["filename"]
+        tracked_filename = prev_entry["filename"]
+        if len(tracked_filename) <= MAX_FILENAME_LENGTH:
+            output_path = folder / tracked_filename
     elif output_path.exists():
         # Handle name collisions by appending part of the resource id
-        short_id = rule_id.split("/")[-1][:8]
-        filename = safe_filename(display_name) + f"_{short_id}.json"
+        filename = build_resource_filename(f"{display_name}_{rule_id.split('/')[-1][:8]}", rule_id)
         output_path = folder / filename
 
     # Change detection
@@ -1135,6 +1183,14 @@ def parse_args() -> argparse.Namespace:
         help="Root directory for extracted files (default: ./output)",
     )
     parser.add_argument(
+        "--filename-uid",
+        action="store_true",
+        help=(
+            "Force saved JSON filenames to use a truncated display name plus a stable UID suffix. "
+            "Useful on Windows when resource names are too long for filenames."
+        ),
+    )
+    parser.add_argument(
         "--skip-alert-rules",
         action="store_true",
         help="Skip extraction of alert rules",
@@ -1304,10 +1360,12 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
         args_skip = {}  # no skip flags by default
         output_dir = cfg.get("output_dir", "output")
         debug = cfg.get("debug", False)
+        filename_uid = cfg.get("filename_uid", False)
     else:
         args = parse_args()
         debug = args.debug
         output_dir = args.output_dir
+        filename_uid = args.filename_uid
         try:
             cfg = resolve_config(args)
         except ValueError as exc:
@@ -1370,6 +1428,9 @@ def run_extraction(cfg_overrides: dict | None = None) -> dict:
 
     # Load file tracker for change detection
     load_tracker(output_root)
+    set_filename_uid_mode(filename_uid)
+    if filename_uid:
+        log.info("Filename UID mode enabled.")
 
     # Authenticate via TokenManager (supports managed identity or client creds)
     try:
